@@ -58,14 +58,6 @@ func (s *Service) ApprovePlan(
 		return domain.PrepPlan{}, err
 	}
 
-	workbenchID, ok := s.repo.FindAvailableWorkbench()
-	if !ok {
-		return domain.PrepPlan{}, contracts.Conflict("workbench_unavailable", "暂无可分配的制备工作位")
-	}
-	if err := s.repo.ReserveWorkbench(planID, workbenchID); err != nil {
-		return domain.PrepPlan{}, err
-	}
-
 	var approved domain.PrepPlan
 	err := s.repo.Mutate(func(m *repository.Mutation) error {
 		plan, ok := m.GetPlan(planID)
@@ -82,10 +74,20 @@ func (s *Service) ApprovePlan(
 		if err := specimen.MarkPreparing(s.now()); err != nil {
 			return err
 		}
-		plan.WorkbenchID = workbenchID
-		if err := m.AssignWorkbench(plan.ID, workbenchID, s.now()); err != nil {
+
+		// Claim a workbench inside the same transaction that advances the plan
+		// and specimen. A failed claim rolls everything back and leaves no
+		// dangling reservation, and the repository lock makes the choice
+		// atomic with maintenance requests sharing the same workbench pool.
+		workbenchID, ok := m.FindAvailableWorkbench()
+		if !ok {
+			return contracts.Conflict("workbench_unavailable", "暂无可分配的制备工作位")
+		}
+		if err := m.OccupyWorkbench(plan.ID, workbenchID, s.now()); err != nil {
 			return err
 		}
+		plan.WorkbenchID = workbenchID
+
 		m.PutPlan(plan)
 		m.PutSpecimen(specimen)
 		approved = plan
