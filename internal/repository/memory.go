@@ -11,12 +11,11 @@ import (
 var defaultWorkbenchIDs = []string{"bench-a", "bench-b", "bench-c"}
 
 type state struct {
-	specimens             map[string]domain.Specimen
-	plans                 map[string]domain.PrepPlan
-	progress              map[string][]domain.ProgressEntry
-	releases              map[string]domain.ReleaseRecord
-	workbenches           map[string]domain.Workbench
-	workbenchReservations map[string]string
+	specimens   map[string]domain.Specimen
+	plans       map[string]domain.PrepPlan
+	progress    map[string][]domain.ProgressEntry
+	releases    map[string]domain.ReleaseRecord
+	workbenches map[string]domain.Workbench
 }
 
 type MemoryRepository struct {
@@ -37,12 +36,11 @@ func NewMemory() *MemoryRepository {
 	}
 	return &MemoryRepository{
 		state: state{
-			specimens:             make(map[string]domain.Specimen),
-			plans:                 make(map[string]domain.PrepPlan),
-			progress:              make(map[string][]domain.ProgressEntry),
-			releases:              make(map[string]domain.ReleaseRecord),
-			workbenches:           workbenches,
-			workbenchReservations: make(map[string]string),
+			specimens:   make(map[string]domain.Specimen),
+			plans:       make(map[string]domain.PrepPlan),
+			progress:    make(map[string][]domain.ProgressEntry),
+			releases:    make(map[string]domain.ReleaseRecord),
+			workbenches: workbenches,
 		},
 	}
 }
@@ -67,12 +65,11 @@ func (r *MemoryRepository) Mutate(fn func(*Mutation) error) error {
 
 func cloneMutation(source state) *Mutation {
 	copied := state{
-		specimens:             make(map[string]domain.Specimen, len(source.specimens)),
-		plans:                 make(map[string]domain.PrepPlan, len(source.plans)),
-		progress:              make(map[string][]domain.ProgressEntry, len(source.progress)),
-		releases:              make(map[string]domain.ReleaseRecord, len(source.releases)),
-		workbenches:           make(map[string]domain.Workbench, len(source.workbenches)),
-		workbenchReservations: make(map[string]string, len(source.workbenchReservations)),
+		specimens:   make(map[string]domain.Specimen, len(source.specimens)),
+		plans:       make(map[string]domain.PrepPlan, len(source.plans)),
+		progress:    make(map[string][]domain.ProgressEntry, len(source.progress)),
+		releases:    make(map[string]domain.ReleaseRecord, len(source.releases)),
+		workbenches: make(map[string]domain.Workbench, len(source.workbenches)),
 	}
 	for key, value := range source.specimens {
 		copied.specimens[key] = value
@@ -89,33 +86,7 @@ func cloneMutation(source state) *Mutation {
 	for key, value := range source.workbenches {
 		copied.workbenches[key] = value
 	}
-	for key, value := range source.workbenchReservations {
-		copied.workbenchReservations[key] = value
-	}
 	return &Mutation{state: copied}
-}
-
-func (r *MemoryRepository) FindAvailableWorkbench() (string, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, id := range defaultWorkbenchIDs {
-		workbench, ok := r.state.workbenches[id]
-		if !ok || workbench.Status != domain.WorkbenchAvailable {
-			continue
-		}
-		if _, reserved := r.state.workbenchReservations[id]; reserved {
-			continue
-		}
-		return id, true
-	}
-	return "", false
-}
-
-func (r *MemoryRepository) ReserveWorkbench(planID, workbenchID string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.state.workbenchReservations[workbenchID] = planID
-	return nil
 }
 
 type Mutation struct {
@@ -215,11 +186,7 @@ func (m *Mutation) PutRelease(value domain.ReleaseRecord) {
 
 func (m *Mutation) ListWorkbenches() []domain.Workbench {
 	values := make([]domain.Workbench, 0, len(m.state.workbenches))
-	for id, value := range m.state.workbenches {
-		if planID, reserved := m.state.workbenchReservations[id]; reserved && value.Status == domain.WorkbenchAvailable {
-			value.Status = domain.WorkbenchOccupied
-			value.PlanID = planID
-		}
+	for _, value := range m.state.workbenches {
 		values = append(values, value)
 	}
 	sort.Slice(values, func(i, j int) bool {
@@ -237,42 +204,32 @@ func (m *Mutation) PutWorkbench(value domain.Workbench) {
 	m.state.workbenches[value.ID] = value
 }
 
-func (m *Mutation) AssignWorkbench(planID, workbenchID string, now time.Time) error {
-	workbench, ok := m.state.workbenches[workbenchID]
-	if !ok {
-		return nil
-	}
-	if workbench.Status == domain.WorkbenchMaintenance {
-		return nil
-	}
-	workbench.Status = domain.WorkbenchOccupied
-	workbench.PlanID = planID
-	workbench.Reason = ""
-	workbench.Version++
-	workbench.UpdatedAt = now.UTC()
-	m.state.workbenches[workbenchID] = workbench
-	return nil
-}
-
-func (m *Mutation) MarkWorkbenchCleaned(planID string, now time.Time) {
-	for id, workbench := range m.state.workbenches {
-		if workbench.PlanID != planID {
+// AcquireWorkbench atomically picks a free workbench and marks it occupied by
+// the plan. It returns false when every workbench is occupied or in
+// maintenance, leaving the transaction state untouched.
+func (m *Mutation) AcquireWorkbench(planID string, now time.Time) (string, bool) {
+	for _, id := range defaultWorkbenchIDs {
+		workbench, ok := m.state.workbenches[id]
+		if !ok || workbench.Status != domain.WorkbenchAvailable {
 			continue
 		}
+		workbench.Status = domain.WorkbenchOccupied
+		workbench.PlanID = planID
+		workbench.Reason = ""
 		workbench.Version++
 		workbench.UpdatedAt = now.UTC()
 		m.state.workbenches[id] = workbench
+		return id, true
 	}
+	return "", false
 }
 
+// ReleaseWorkbench returns the workbench occupied by the plan to the shared
+// pool when the job ends. It never touches workbenches claimed by another plan
+// or kept in maintenance.
 func (m *Mutation) ReleaseWorkbench(planID string, now time.Time) {
-	for id, reservedPlanID := range m.state.workbenchReservations {
-		if reservedPlanID == planID {
-			delete(m.state.workbenchReservations, id)
-		}
-	}
 	for id, workbench := range m.state.workbenches {
-		if workbench.PlanID != planID {
+		if workbench.Status != domain.WorkbenchOccupied || workbench.PlanID != planID {
 			continue
 		}
 		workbench.Status = domain.WorkbenchAvailable

@@ -53,7 +53,7 @@ func (s *Service) LogProgress(
 			if err := specimen.MarkStabilized(s.now()); err != nil {
 				return err
 			}
-			m.MarkWorkbenchCleaned(plan.ID, s.now())
+			m.ReleaseWorkbench(plan.ID, s.now())
 		}
 		m.AppendProgress(entry)
 		m.PutPlan(plan)
